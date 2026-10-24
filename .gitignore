@@ -1,0 +1,44 @@
+
+# Python cache and compiled files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Secrets and environment variables
+.env
+.env.*
+!.env.example
+.kaggle/
+secrets/
+*token*
+*credentials*
+
+# Model weights, caches, and large generated artifacts
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.bin
+artifacts/
+outputs/
+results/
+logs/
+wandb/
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+
+# Windows metadata
+Zone.Identifier
+*:Zone.Identifier
+Thumbs.db
+Desktop.ini
+
+# OS/editor files
+.DS_Store
+.vscode/
