@@ -91,3 +91,12 @@ Record library, torch and transformers versions, GPU, seeds and the lens revisio
 
 ## Deviation log
 (Dated entries only, each with the reason. Git history is the timestamp.)
+
+- **2026-10-25, Gate 0 run 1 (repo commit 35fb5f9b2e1b2600ee715a44c0f1951233cea0d3), before any endpoint was computed.**
+  G0.b/c failed with CUDA out-of-memory on a Kaggle T4 (14.56 GiB): fp32 Gemma-2-2b (about 10.5 GB of weights) plus the library's full-vocabulary dictionary. G0.e, G0.g and G0.d failed from the same OOM and carry no independent information (G0.d additionally because the script kept a reference to the HF model, so deleting `model` freed nothing; script bug). Observed fine: self-test passed on Kaggle, model and lens loaded (G0.a), artifact revision a4114d77, `n_prompts` = 454, `d_model` = 2304.
+  Amendments (pre-endpoint; no threshold, endpoint, dose rule, layer, k or split changed):
+  1. Clean fp32 activations are cached in a separate phase, after which the fp32 model is freed.
+  2. The decomposition model and the dictionary are built in **bf16** (the precision the published lens was fitted and demonstrated in, as I read the tutorial; fp16 fallback). The decomposed activations remain the fp32 clean ones. This differs from the "fp32 everywhere" wording in section 2, and Stage 1 results will be labelled accordingly.
+  3. A fresh lens object per layer and GPU memory logged at every step.
+  4. G0.g(i) compares hook and HF hidden states in the decomposition dtype with tolerance 1e-2 instead of 1e-4.
+  5. `rho_med` is measured between the fp32 activations and the decomposition-dtype activations of the same run.

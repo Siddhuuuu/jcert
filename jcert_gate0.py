@@ -250,6 +250,10 @@ def selftest():
 
 
 # ------------------------------------------------------------------ Gate 0 (needs torch + transformer_lens)
+# Memory discipline (after the first Kaggle run hit OOM on a 14.6 GiB T4): phases, each in its own function so
+# model references die with the function; fp32 model only to cache clean activations; decomposition model in
+# bf16 (the precision the published lens was fitted in); a fresh lens object per layer so the library cannot
+# accumulate one full-vocabulary dictionary per layer on the GPU; GPU memory logged after every step.
 
 PROMPTS = (
     "Paris grew around islands in the Seine and became a center of art, politics, science, commerce, and education across Europe for many centuries.",
@@ -264,6 +268,34 @@ TUTORIAL_PROMPT = "Fact: The currency used in the country shaped like a boot is"
 TUTORIAL_TOP1 = {4: " anything", 8: "\n\n\n", 13: "LookAnd", 17: "LookAnd", 21: " euro", 24: " the"}
 
 
+def _free():
+    import gc
+
+    import torch
+
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def _mem(out, tag):
+    import torch
+
+    if torch.cuda.is_available():
+        out.setdefault("gpu_gb", {})[tag] = {"allocated": round(torch.cuda.memory_allocated() / 1e9, 2),
+                                              "peak": round(torch.cuda.max_memory_allocated() / 1e9, 2)}
+
+
+def _boot(a, dtype_name):
+    import torch
+    from transformer_lens.model_bridge import TransformerBridge
+
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    m = TransformerBridge.boot_transformers(a.model, device=dev, dtype=getattr(torch, dtype_name))
+    m.eval()
+    return m, dev
+
+
 def _collect(model, layers):
     hooks = {l: f"blocks.{l}.hook_out" for l in layers}
     acts = {}
@@ -272,52 +304,92 @@ def _collect(model, layers):
         for l, hn in hooks.items():
             for pos in POSITIONS:
                 acts[(l, p, pos)] = cache[hn][0, pos].detach().float().cpu().numpy()
+        del cache
     return acts
 
 
-def run_gate0(a):
-    import gc
+def phase_fp32_activations(a):
+    """fp32 model alone: cache the clean reference activations, then free the model completely."""
+    model, _ = _boot(a, "float32")
+    acts = _collect(model, a.layers)
+    del model
+    _free()
+    return acts
 
+
+def _boot_decomp(a, out):
+    """Decomposition-precision model with fallback bf16 -> fp16; checks the activations are finite."""
+    last = None
+    for name in (a.decomp_dtype, "float16"):
+        try:
+            model, dev = _boot(a, name)
+            acts = _collect(model, a.layers)
+            if not all(np.isfinite(v).all() for v in acts.values()):
+                raise ValueError("non-finite activations in " + name)
+            out["decomp_dtype"] = name
+            return model, dev, acts
+        except Exception as e:  # noqa: BLE001
+            last = e
+            out["errors"]["boot " + name] = repr(e)
+            _free()
+    raise last
+
+
+def phase_decompose(a, acts32, out):
     import torch
     from huggingface_hub import hf_hub_download
-    from transformer_lens.model_bridge import TransformerBridge
     from transformer_lens.tools.analysis import JacobianLens
 
-    out = {"args": vars(a), "gates": {}, "errors": {}}
-    dev = "cuda" if torch.cuda.is_available() else "cpu"
-    out["device"] = dev
+    gates = out["gates"]
+    model, dev, acts_lp = _boot_decomp(a, out)
+    _mem(out, "model loaded (decomposition dtype)")
+    gates["G0.a load"] = True
+
+    # G0.d reference dose from the low-precision activations of this very model
+    try:
+        rhos = [float(np.linalg.norm(acts_lp[k] - acts32[k]) / np.linalg.norm(acts32[k])) for k in acts32]
+        out["rho"] = rho_ref(rhos)
+        out["rho_reference_run"] = out["decomp_dtype"]
+        gates["G0.d reference dose determined"] = True
+    except Exception as e:  # noqa: BLE001
+        gates["G0.d reference dose determined"] = False
+        out["errors"]["G0.d"] = repr(e)
 
     def sync():
         if dev == "cuda":
             torch.cuda.synchronize()
 
-    # G0.a load
-    try:
-        model = TransformerBridge.boot_transformers(a.model, device=dev, dtype=torch.float32)
-        model.eval()
+    def new_lens():
         try:
-            lens = JacobianLens.from_pretrained(a.lens_name, model=model, revision=a.lens_revision)
+            return JacobianLens.from_pretrained(a.lens_name, model=model, revision=a.lens_revision)
         except TypeError:
-            lens = JacobianLens.from_pretrained(a.lens_name, model=model)
-            out["errors"]["G0.a note"] = "from_pretrained rejected revision=; loaded default revision"
-        out["lens_metadata"] = str(getattr(lens, "metadata", None))
-        out["gates"]["G0.a load"] = True
-    except Exception as e:  # noqa: BLE001
-        out["gates"]["G0.a load"] = False
-        out["errors"]["G0.a"] = repr(e)
-        return _finish(out, a)
+            return JacobianLens.from_pretrained(a.lens_name, model=model)
 
-    acts = _collect(model, a.layers)
-    times, rel_err, recon_err, e0_ok, conv = [], [], [], True, set()
-    t_sig, t_swap, t_gap = [], [], []
+    # artifact for G0.g (CPU only)
+    art_J, Wu, hf = None, None, getattr(model, "original_model", None)
+    if not a.skip_compat:
+        try:
+            path = hf_hub_download("neuronpedia/jacobian-lens", filename=a.artifact_file, revision=a.artifact_revision)
+            art = torch.load(path, map_location="cpu", weights_only=True)
+            art_J = {int(k): v.float() for k, v in art["J"].items()}
+            out["artifact"] = {"revision": a.artifact_revision, "n_prompts": art.get("n_prompts"), "d_model": art.get("d_model")}
+            Wu = hf.lm_head.weight.detach().float().cpu()
+        except Exception as e:  # noqa: BLE001
+            out["errors"]["G0.g artifact"] = repr(e)
+
+    times, rel_err, recon_err, conv, e0_ok = [], [], [], set(), True
+    t_sig, t_swap, t_gap, med_var, worst_cos = [], [], [], {}, 1.0
     try:
         for l in a.layers:
+            lens = new_lens()
             Dt = lens.lens_vector_dictionary(model, l)
             D = (Dt.detach().float().cpu().numpy() if hasattr(Dt, "detach") else np.asarray(Dt)).astype(np.float32)
+            del Dt
+            _mem(out, f"layer {l}: dictionary built")
             corr_fn = lambda r, D=D: D @ np.asarray(r, dtype=np.float32)
             get_atoms = lambda ids, D=D: D[np.asarray(ids)]
             timed = False
-            for (ll, p, pos), h_np in acts.items():
+            for (ll, p, pos), h_np in acts32.items():
                 if ll != l:
                     continue
                 h = torch.tensor(h_np, device=dev)
@@ -328,7 +400,7 @@ def run_gate0(a):
                     dec = lens.decompose(model, h, layer=l, k=a.k, algorithm="gradient_pursuit")
                     sync()
                     ts.append(time.perf_counter() - t0)
-                times.append(statistics.median(ts[1:]))  # first call may build caches
+                times.append(statistics.median(ts[1:]))
                 ids = dec.selected_support.detach().cpu().numpy()
                 lib = dec.j_space_component.detach().float().cpu().numpy()
                 rel_err.append(float(np.linalg.norm(component(h_np, D[ids]) - lib) / max(np.linalg.norm(lib), 1e-12)))
@@ -346,107 +418,98 @@ def run_gate0(a):
                     t0 = time.perf_counter(); swap_margin(h_np, D[ids], ids, corr_fn, get_atoms); t_swap.append(time.perf_counter() - t0)
                     t0 = time.perf_counter(); min_gap(h_np, ids, corr_fn, get_atoms); t_gap.append(time.perf_counter() - t0)
                     timed = True
-            del D, Dt
-            gc.collect()
-        out["gates"]["G0.b metrics reproduce library"] = bool(max(rel_err) < 1e-3 and max(recon_err) < 1e-3 and e0_ok)
+                del h, dec
+            _mem(out, f"layer {l}: decomposed")
+            # G0.e for this layer only, so cached dictionaries cannot pile up
+            try:
+                prof = lens.fraction_of_variance(model, list(PROMPTS), layers=[l], k=a.k, positions=list(POSITIONS))
+                med_var[l] = float(prof.median[l])
+            except Exception as e:  # noqa: BLE001
+                out["errors"][f"G0.e layer {l}"] = repr(e)
+            # G0.g (ii): library rows vs artifact-derived rows W_U J_l
+            if art_J is not None and Wu is not None:
+                samp = np.random.default_rng(0).choice(Wu.shape[0], 200, replace=False)
+                ref = (Wu[samp] @ art_J[l]).numpy()
+                Dn = D[samp]
+                cos = (Dn * ref).sum(1) / (np.linalg.norm(Dn, axis=1) * np.linalg.norm(ref, axis=1) + 1e-12)
+                worst_cos = min(worst_cos, float(cos.min()))
+            del lens, D, corr_fn, get_atoms
+            _free()
+        gates["G0.b metrics reproduce library"] = bool(max(rel_err) < 1e-3 and max(recon_err) < 1e-3 and e0_ok)
         out["max_component_rel_err"] = max(rel_err)
         out["max_reconstruction_rel_err"] = max(recon_err)
         out["reconstruction_convention"] = sorted(conv)
         out["t_gp_seconds_median"] = statistics.median(times)
         out["feature_seconds_per_unit"] = {"sigma": statistics.median(t_sig), "swap": statistics.median(t_swap),
                                            "gap": statistics.median(t_gap)}
-        tf = sum(out["feature_seconds_per_unit"].values())
-        if dev == "cuda":
-            out["peak_gpu_gb"] = torch.cuda.max_memory_allocated() / 1e9
-        out["gates"]["G0.c memory and timing measured"] = True
-        out["budget_plan"] = budget_plan(out["t_gp_seconds_median"], t_feature=tf)
+        gates["G0.c memory and timing measured"] = True
+        out["budget_plan"] = budget_plan(out["t_gp_seconds_median"], t_feature=sum(out["feature_seconds_per_unit"].values()))
     except Exception as e:  # noqa: BLE001
-        out["gates"]["G0.b metrics reproduce library"] = False
-        out["gates"]["G0.c memory and timing measured"] = False
+        gates["G0.b metrics reproduce library"] = False
+        gates["G0.c memory and timing measured"] = False
         out["errors"]["G0.b/c"] = repr(e)
+    if med_var:
+        out["variance_fraction_median"] = med_var
+        gates["G0.e non-degenerate (>=3% in >=3 layers)"] = sum(v >= 0.03 for v in med_var.values()) >= 3
+    else:
+        gates["G0.e non-degenerate (>=3% in >=3 layers)"] = False
 
-    # G0.e non-degeneracy
+    # G0.g (i) hook activation vs HF hidden state (same model, same dtype), (iii) published top-1 tokens
+    key = "G0.g compatible (act diff<1e-2 in bf16, cos>=0.999, >=4/6 published top-1)"
     try:
-        prof = lens.fraction_of_variance(model, list(PROMPTS), layers=list(a.layers), k=a.k, positions=list(POSITIONS))
-        med = {int(l): float(prof.median[l]) for l in prof.layers}
-        out["variance_fraction_median"] = med
-        out["gates"]["G0.e non-degenerate (>=3% in >=3 layers)"] = sum(v >= 0.03 for v in med.values()) >= 3
-    except Exception as e:  # noqa: BLE001
-        out["gates"]["G0.e non-degenerate (>=3% in >=3 layers)"] = False
-        out["errors"]["G0.e"] = repr(e)
-
-    # G0.g coordinate compatibility with the published artifact and the tutorial's reference readout
-    if not a.skip_compat:
-        try:
-            hf = getattr(model, "original_model", None)
-            if hf is None:
-                raise RuntimeError("cannot reach the underlying HF model via model.original_model")
-            path = hf_hub_download("neuronpedia/jacobian-lens", filename=a.artifact_file, revision=a.artifact_revision)
-            art = torch.load(path, map_location="cpu", weights_only=True)
-            J = {int(k): v.float() for k, v in art["J"].items()}
-            out["artifact"] = {"revision": a.artifact_revision, "n_prompts": art.get("n_prompts"), "d_model": art.get("d_model")}
-            hdev = hf.lm_head.weight.device
-            # (i) TL hook activation == HF hidden state
-            worst_act = 0.0
-            for p, text in enumerate(PROMPTS):
-                with torch.no_grad():
-                    hs = hf(input_ids=model.to_tokens(text).to(hdev), output_hidden_states=True).hidden_states
-                for l in a.layers:
-                    for pos in POSITIONS:
-                        ref = hs[l + 1][0, pos].float().cpu().numpy()
-                        worst_act = max(worst_act, float(np.linalg.norm(acts[(l, p, pos)] - ref) / np.linalg.norm(ref)))
-            # (ii) library dictionary rows == artifact-derived rows W_U J (cosine)
-            Wu = hf.lm_head.weight.detach().float().cpu()
-            samp = np.random.default_rng(0).choice(Wu.shape[0], 200, replace=False)
-            worst_cos = 1.0
-            for l in a.layers:
-                Dt = lens.lens_vector_dictionary(model, l)
-                Dn = (Dt.detach().float().cpu().numpy() if hasattr(Dt, "detach") else np.asarray(Dt))[samp]
-                ref = (Wu[samp] @ J[l]).numpy()
-                cos = (Dn * ref).sum(1) / (np.linalg.norm(Dn, axis=1) * np.linalg.norm(ref, axis=1) + 1e-12)
-                worst_cos = min(worst_cos, float(cos.min()))
-                del Dt, Dn
-            # (iii) manual canonical readout reproduces the published top-1 tokens
-            cap = hf.config.final_logit_softcapping
-            toks = model.to_tokens(TUTORIAL_PROMPT).to(hdev)
+        if hf is None or art_J is None:
+            raise RuntimeError("underlying HF model or artifact unavailable")
+        hdev = hf.lm_head.weight.device
+        worst_act = 0.0
+        for p, text in enumerate(PROMPTS):
             with torch.no_grad():
-                hs = hf(input_ids=toks, output_hidden_states=True).hidden_states
-                match = {}
-                for l, want in TUTORIAL_TOP1.items():
-                    est = hs[l + 1][0, -1].float() @ J[l].to(hdev).T
-                    logits = hf.lm_head(hf.model.norm(est.to(hf.lm_head.weight.dtype))).float()
-                    logits = cap * torch.tanh(logits / cap)
-                    got = model.tokenizer.decode([int(logits.argmax())])
-                    match[l] = (got, got == want)
-            n_match = sum(v[1] for v in match.values())
-            out["compat"] = {"worst_activation_rel_diff": worst_act, "worst_dictionary_cosine": worst_cos,
-                             "tutorial_top1": {str(k): v for k, v in match.items()}}
-            out["gates"]["G0.g compatible (act diff<1e-4, cos>=0.999, >=4/6 published top-1)"] = bool(
-                worst_act < 1e-4 and worst_cos >= 0.999 and n_match >= 4)
-        except Exception as e:  # noqa: BLE001
-            out["gates"]["G0.g compatible (act diff<1e-4, cos>=0.999, >=4/6 published top-1)"] = False
-            out["errors"]["G0.g"] = repr(e)
+                hs = hf(input_ids=model.to_tokens(text).to(hdev), output_hidden_states=True).hidden_states
+            for l in a.layers:
+                for pos in POSITIONS:
+                    ref = hs[l + 1][0, pos].float().cpu().numpy()
+                    worst_act = max(worst_act, float(np.linalg.norm(acts_lp[(l, p, pos)] - ref) / np.linalg.norm(ref)))
+            del hs
+        cap = hf.config.final_logit_softcapping
+        toks = model.to_tokens(TUTORIAL_PROMPT).to(hdev)
+        with torch.no_grad():
+            hs = hf(input_ids=toks, output_hidden_states=True).hidden_states
+            match = {}
+            for l, want in TUTORIAL_TOP1.items():
+                est = hs[l + 1][0, -1].float() @ art_J[l].to(hdev).T
+                logits = hf.lm_head(hf.model.norm(est.to(hf.lm_head.weight.dtype))).float()
+                got = model.tokenizer.decode([int(torch.argmax(cap * torch.tanh(logits / cap)))])
+                match[l] = (got, got == want)
+        del hs
+        out["compat"] = {"worst_activation_rel_diff": worst_act, "worst_dictionary_cosine": worst_cos,
+                         "tutorial_top1": {str(k): v for k, v in match.items()}}
+        gates[key] = bool(worst_act < 1e-2 and worst_cos >= 0.999 and sum(v[1] for v in match.values()) >= 4)
+    except Exception as e:  # noqa: BLE001
+        gates[key] = False
+        out["errors"]["G0.g"] = repr(e)
+    _mem(out, "end of decomposition phase")
+    del model, hf, Wu
+    _free()
 
-    # G0.d rho from a reduced-precision run
-    del model, lens
-    gc.collect()
-    if dev == "cuda":
-        torch.cuda.empty_cache()
-    out["gates"]["G0.d reference dose determined"] = False
-    for name in ("bfloat16", "float16"):
-        try:
-            m2 = TransformerBridge.boot_transformers(a.model, device=dev, dtype=getattr(torch, name))
-            m2.eval()
-            lp = _collect(m2, a.layers)
-            rhos = [float(np.linalg.norm(lp[k] - acts[k]) / np.linalg.norm(acts[k])) for k in acts]
-            if not all(np.isfinite(rhos)):
-                raise ValueError("non-finite activations in " + name)
-            out["lowprec"] = name
-            out["rho"] = rho_ref(rhos)
-            out["gates"]["G0.d reference dose determined"] = True
-            break
-        except Exception as e:  # noqa: BLE001
-            out["errors"]["G0.d " + name] = repr(e)
+
+def run_gate0(a):
+    import os
+
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    import torch
+
+    out = {"args": vars(a), "gates": {}, "errors": {}, "device": "cuda" if torch.cuda.is_available() else "cpu"}
+    try:
+        acts32 = phase_fp32_activations(a)
+        _mem(out, "after fp32 activation phase (model freed)")
+    except Exception as e:  # noqa: BLE001
+        out["gates"]["G0.a load"] = False
+        out["errors"]["fp32 activation phase"] = repr(e)
+        return _finish(out, a)
+    try:
+        phase_decompose(a, acts32, out)
+    except Exception as e:  # noqa: BLE001
+        out["gates"].setdefault("G0.a load", False)
+        out["errors"]["decomposition phase"] = repr(e)
     return _finish(out, a)
 
 
@@ -467,6 +530,7 @@ def main():
     ap.add_argument("--lens-revision", default="a4114d7752d11eb546e6cf372213d7e75526d3a1")
     ap.add_argument("--artifact-file", default="gemma-2-2b/jlens/Salesforce-wikitext/gemma-2-2b_jacobian_lens.pt")
     ap.add_argument("--artifact-revision", default="a4114d7752d11eb546e6cf372213d7e75526d3a1")
+    ap.add_argument("--decomp-dtype", default="bfloat16", help="precision of the decomposition model (fp16 fallback)")
     ap.add_argument("--skip-compat", action="store_true", help="skip G0.g (not recommended)")
     ap.add_argument("--layers", type=int, nargs="+", default=[10, 13, 16, 19, 22])
     ap.add_argument("--k", type=int, default=25)
